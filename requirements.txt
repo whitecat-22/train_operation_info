@@ -1,0 +1,3 @@
+pytz
+slack_sdk
+python-dotenv
