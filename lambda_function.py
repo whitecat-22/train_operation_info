@@ -3,29 +3,13 @@ import json
 import urllib.request
 from datetime import datetime, timezone
 import pytz
-
-# ローカル環境の .env ファイルを読み込むための設定
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    # Lambda環境（本番）では環境変数が直接設定されるため、無視してOK
-    pass
-
-# slack_sdk から WebClient をインポート
-try:
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-except ImportError:
-    # Lambda Layerの設定が未完了の場合の警告
-    print("Warning: slack_sdk not found. Please add it to Lambda Layer.")
+from slack_sdk import WebClient
 
 # 環境変数
 API_URL = os.getenv("METRO_API_URL")
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")  # xoxb- で始まるトークン
-SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")      # チャンネルID (例: C0123456789)
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
 
-# 路線名マッピング
 LINE_NAME_DICT = {
     "odpt.Railway:TokyoMetro.Ginza": "銀座線",
     "odpt.Railway:TokyoMetro.Marunouchi": "丸ノ内線",
@@ -40,90 +24,51 @@ LINE_NAME_DICT = {
 }
 
 def lambda_handler(event, context):
-    """
-    AWS Lambda ハンドラ関数
-    """
-    # ログ出力（デバッグ用）
-    current_event = event if event is not None else {}
-    print(f"Event received: {json.dumps(current_event)}")
+    print(f"Processor started: {json.dumps(event)}")
+
+    # スラッシュコマンド経由か判定（Dispatcherから渡される response_url の有無）
+    response_url = event.get("response_url")
 
     try:
-        # 1. 東京メトロ運行情報の取得
-        # urllibのRequestオブジェクトを明示的に作成（タイムアウト/ローカルエラー対策）
+        # 1. 運行情報取得
         req = urllib.request.Request(API_URL)
         with urllib.request.urlopen(req, timeout=10) as res:
             data_dict = json.loads(res.read().decode("utf-8"))
 
-        # 2. 表示用日時の決定 (APIレスポンスの dc:date を優先)
-        display_time_str = ""
-        try:
-            # APIレスポンスの最初の要素から日付を取得
-            raw_date = data_dict[0].get("dc:date") if data_dict else None
-            if raw_date:
-                dt = datetime.fromisoformat(raw_date)
-                # JST（日本時間）としてフォーマット
-                display_time_str = dt.strftime('%m/%d %H:%M')
-            else:
-                raise ValueError("No date found in API response")
-        except Exception as e:
-            # APIから日時が取れない場合はシステム時刻で代用
-            print(f"Date fallback due to: {e}")
-            tokyo_tz = pytz.timezone('Asia/Tokyo')
-            now_jst = datetime.now(timezone.utc).astimezone(tokyo_tz)
-            display_time_str = now_jst.strftime('%m/%d %H:%M')
+        # 2. 日時整形
+        raw_date = data_dict[0].get("dc:date") if data_dict else None
+        dt = datetime.fromisoformat(raw_date) if raw_date else datetime.now(timezone.utc)
+        display_time = dt.astimezone(pytz.timezone('Asia/Tokyo')).strftime('%m/%d %H:%M')
 
-        # 3. 各路線の運行情報をメッセージに組み立て
-        header = f"🚉 *東京メトロ運行情報* ({display_time_str}現在)"
+        # 3. メッセージ構築
+        header = f"🚉 *東京メトロ運行情報* ({display_time}現在)"
         info_lines = []
-
         for info in data_dict:
-            railway_id = info.get("odpt:railway")
-            if railway_id in LINE_NAME_DICT:
-                line_name = LINE_NAME_DICT[railway_id]
-                # 運行情報のテキストを取得
-                status_text = info.get("odpt:trainInformationText", {}).get("ja", "情報なし")
+            rid = info.get("odpt:railway")
+            if rid in LINE_NAME_DICT:
+                txt = info.get("odpt:trainInformationText", {}).get("ja", "情報なし")
+                icon = "✅" if "平常" in txt else "⚠️"
+                info_lines.append(f"{icon} *{LINE_NAME_DICT[rid]}*: {txt}")
 
-                # アイコンの判定（平常時以外は警告アイコン）
-                icon = "✅" if "平常" in status_text else "⚠️"
-                info_lines.append(f"{icon} *{line_name}*: {status_text}")
+        full_message = f"{header}\n\n" + "\n".join(info_lines)
 
-        # 万が一情報が1件もない場合のメッセージ
-        if not info_lines:
-            full_message = f"{header}\n現在、対象路線の運行情報を取得できませんでした。"
+        # 4. 送信処理
+        if response_url:
+            # スラッシュコマンドへの非同期応答（response_urlへPOST）
+            payload = {"text": full_message, "response_type": "in_channel"}
+            req_slack = urllib.request.Request(
+                response_url,
+                data=json.dumps(payload).encode(),
+                headers={'Content-Type': 'application/json'}
+            )
+            urllib.request.urlopen(req_slack)
         else:
-            full_message = f"{header}\n\n" + "\n".join(info_lines)
+            # 定期実行
+            client = WebClient(token=SLACK_BOT_TOKEN)
+            client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=full_message)
 
-        # 4. Slackへ送信
-        # 環境変数の存在チェック
-        if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
-            raise ValueError("Environment variables SLACK_BOT_TOKEN or SLACK_CHANNEL are missing.")
+        return {'statusCode': 200}
 
-        client = WebClient(token=SLACK_BOT_TOKEN)
-        response = client.chat_postMessage(
-            channel=SLACK_CHANNEL_ID,
-            text=full_message
-        )
-
-        print(f"Post successful. Message TS: {response['ts']}")
-        return {
-            'statusCode': 200,
-            'body': json.dumps({'message': 'Success', 'ts': response['ts']})
-        }
-
-    except SlackApiError as e:
-        error_msg = f"Slack API Error: {e.response['error']}"
-        print(error_msg)
-        return {'statusCode': 500, 'body': json.dumps(error_msg)}
     except Exception as e:
-        import traceback
-        error_msg = f"Unexpected Error: {str(e)}"
-        print(error_msg)
-        print(traceback.format_exc()) # エラーの詳細をログに出力
-        return {'statusCode': 500, 'body': json.dumps(error_msg)}
-
-# --- ローカル実行用 ---
-if __name__ == "__main__":
-    # ローカルで実行する場合、.envファイルがあることを前提に動きます
-    print("Executing locally...")
-    result = lambda_handler(event={}, context=None)
-    print(f"Execution Result: {result}")
+        print(f"Error: {str(e)}")
+        return {'statusCode': 500}
