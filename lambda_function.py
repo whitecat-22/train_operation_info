@@ -40,35 +40,68 @@ def lambda_handler(event, context):
         dt = datetime.fromisoformat(raw_date) if raw_date else datetime.now(timezone.utc)
         display_time = dt.astimezone(pytz.timezone('Asia/Tokyo')).strftime('%m/%d %H:%M')
 
-        # 3. メッセージ構築
-        header = f"🚉 *東京メトロ運行情報* ({display_time}現在)"
-        info_lines = []
+        # 3. データの解析と色の決定
+        fields = []
+        is_any_delay = False # 全路線のうち一つでも遅延があるか保持
+
         for info in data_dict:
             rid = info.get("odpt:railway")
             if rid in LINE_NAME_DICT:
-                txt = info.get("odpt:trainInformationText", {}).get("ja", "情報なし")
-                icon = "✅" if "平常" in txt else "⚠️"
-                info_lines.append(f"{icon} *{LINE_NAME_DICT[rid]}*: {txt}")
+                status_text = info.get("odpt:trainInformationText", {}).get("ja", "情報なし")
 
-        full_message = f"{header}\n\n" + "\n".join(info_lines)
+                # 平常運転以外が含まれるか判定
+                is_normal = "平常" in status_text
+                if not is_normal:
+                    is_any_delay = True
 
-        # 4. 送信処理
+                icon = "✅" if is_normal else "⚠️"
+                fields.append({
+                    "title": f"{icon} {LINE_NAME_DICT[rid]}",
+                    "value": status_text,
+                    "short": False # 横並びにせず、1行ずつ表示
+                })
+
+        # 4. メッセージ全体の色の決定
+        # 全体で一つでも遅延があれば「赤」、すべて平常なら「緑」
+        attachment_color = "#ff0000" if is_any_delay else "#36a64f"
+
+        # 5. Attachment構造の組み立て
+        attachment = {
+            "color": attachment_color,
+            "title": f"東京メトロ運行情報 ({display_time}現在)",
+            "fields": fields,
+            "fallback": "東京メトロの最新運行情報をお届けします。"
+        }
+
+        # 6. 送信処理
         if response_url:
-            # スラッシュコマンドへの非同期応答（response_urlへPOST）
-            payload = {"text": full_message, "response_type": "in_channel"}
-            req_slack = urllib.request.Request(
-                response_url,
-                data=json.dumps(payload).encode(),
-                headers={'Content-Type': 'application/json'}
-            )
-            urllib.request.urlopen(req_slack)
+            # スラッシュコマンドへの応答
+            payload = {
+                "response_type": "in_channel",
+                "attachments": [attachment]
+            }
+            send_post(response_url, payload)
         else:
             # 定期実行
             client = WebClient(token=SLACK_BOT_TOKEN)
-            client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=full_message)
+            client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                text="🔔 定期運行情報のお知らせ",
+                attachments=[attachment]
+            )
 
         return {'statusCode': 200}
 
     except Exception as e:
         print(f"Error: {str(e)}")
         return {'statusCode': 500}
+
+def send_post(url, payload):
+    """汎用POST関数"""
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'}
+    )
+    with urllib.request.urlopen(req) as res:
+        return res.read().decode()
